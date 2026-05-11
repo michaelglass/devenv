@@ -11,7 +11,7 @@
 
 ### Improvements
 
-- Added `nixosModules.default` and `homeManagerModules.default` flake outputs that expose `programs.devenv.enable` and per-shell integration toggles. The package now also installs hook scripts under `$out/share/devenv/shell-integration/<shell>/hook.<ext>` so they can be sourced directly.
+- Added `nixosModules.default`, `darwinModules.default`, and `homeManagerModules.default` flake outputs that expose `programs.devenv.enable` and per-shell integration toggles. The package now also installs hook scripts under `$out/share/devenv/shell-integration/<shell>/hook.<ext>` so they can be sourced directly.
 - Bumped `secretspec` to `v0.9.1`. The new `bws` (Bitwarden Secrets Manager) feature is not enabled because its transitive `bitwarden` crate conflicts with `sqlx` 0.8 on `libsqlite3-sys` and pins `typenum` to 1.18.
 - Bumped `iocraft` to `0.8.2` and switched the `[patch.crates-io]` entry from the `cachix/iocraft` fork to upstream `ccbrown/iocraft` `main`, now that the row-level diff and stderr rendering patches are merged upstream.
 
