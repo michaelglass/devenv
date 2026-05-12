@@ -11,6 +11,7 @@
 - Fixed `devenv shell` skipping the user's `.zshenv` when launching zsh, which could mangle prompts and break `.zshrc` configurations that depend on env vars defined in `.zshenv`. The user's `.zshenv` is now sourced before `.zshrc` during shell init, matching zsh's documented startup order ([#2802](https://github.com/cachix/devenv/pull/2802)).
 - Fixed the bash/zsh shell hook (`devenv hook bash`/`zsh`) re-launching `devenv shell` on every prompt redraw after the user interrupted a slow eval with Ctrl-C. The hook now caches `$PWD` before launching the subshell, so an aborted or failed activation no longer retries until the user `cd`s away and back.
 - Fixed `devenv hook <shell>` panicking with `failed printing to stdout: Broken pipe (os error 32)` when its downstream reader (e.g. `source` in `devenv hook fish | source`) closes the pipe before the script is fully flushed.
+- Fixed the shell hook closing the user's terminal when cd-ing out of a project directory while `DEVENV_ROOT` was exported into the outer shell (e.g. via direnv). The "exit on cd-out" path now keys off `_DEVENV_HOOK_DIR`, which is only set on shells the hook spawned, instead of `DEVENV_ROOT` alone ([#2805](https://github.com/cachix/devenv/issues/2805)).
 
 ### Improvements
 
