@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -76,15 +77,121 @@ struct SpecialAnchorIndex {
     pending: Vec<RegistrationId>,
 }
 
-#[derive(Debug, Default)]
+/// Identity of the filesystem object at a path. A path replaced by a rename
+/// or by delete-and-recreate gets a new identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileIdentity {
+    Missing,
+    Inode { dev: u64, ino: u64 },
+}
+
+impl FileIdentity {
+    fn of(path: &Path) -> Self {
+        use std::os::unix::fs::MetadataExt;
+
+        match std::fs::metadata(path) {
+            Ok(metadata) => Self::Inode {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            },
+            Err(_) => Self::Missing,
+        }
+    }
+}
+
+/// A native watch root and the registrations using it.
+#[derive(Debug)]
 struct AnchorUsage {
-    registrations: u32,
+    registrations: NonZeroU32,
     recursive_count: u32,
+    /// What the native watch was registered on: the anchor's identity when it
+    /// was added to the pathset or last re-registered.
+    identity: FileIdentity,
+}
+
+/// The outcome of dropping one registration from an anchor.
+enum AfterRemove {
+    /// That was the last registration: the native watch is no longer needed.
+    Released,
+    /// Other registrations still use the anchor.
+    StillUsed(AnchorUsage),
 }
 
 impl AnchorUsage {
+    fn new(recursive: bool, identity: FileIdentity) -> Self {
+        Self {
+            registrations: NonZeroU32::MIN,
+            recursive_count: u32::from(recursive),
+            identity,
+        }
+    }
+
+    fn add(&mut self, recursive: bool) {
+        self.registrations = self
+            .registrations
+            .checked_add(1)
+            .expect("anchor registration count overflow");
+        self.recursive_count += u32::from(recursive);
+    }
+
+    fn remove(self, recursive: bool) -> AfterRemove {
+        let recursive_count = self.recursive_count - u32::from(recursive);
+        match NonZeroU32::new(self.registrations.get() - 1) {
+            None => AfterRemove::Released,
+            Some(registrations) => AfterRemove::StillUsed(Self {
+                registrations,
+                recursive_count,
+                ..self
+            }),
+        }
+    }
+
     fn recursive(&self) -> bool {
         self.recursive_count != 0
+    }
+}
+
+/// Whether a logical target is itself a native watch root.
+#[derive(Debug)]
+enum TargetAnchor {
+    /// Watched through another anchor (an ancestor, or a shared parent on Linux).
+    ViaOtherAnchor,
+    /// Registered with the OS at exactly this path.
+    Root(AnchorUsage),
+}
+
+impl TargetAnchor {
+    fn usage(&self) -> Option<&AnchorUsage> {
+        match self {
+            Self::ViaOtherAnchor => None,
+            Self::Root(usage) => Some(usage),
+        }
+    }
+
+    fn usage_mut(&mut self) -> Option<&mut AnchorUsage> {
+        match self {
+            Self::ViaOtherAnchor => None,
+            Self::Root(usage) => Some(usage),
+        }
+    }
+}
+
+/// A registration resolved outside the state lock, with the identity of its
+/// anchor observed at the same time.
+struct ResolvedWatch {
+    target: SharedPath,
+    registration: WatchRegistration,
+    anchor_identity: FileIdentity,
+}
+
+impl ResolvedWatch {
+    fn new((target, registration): (SharedPath, WatchRegistration)) -> Self {
+        let anchor_identity = FileIdentity::of(&registration.anchor);
+        Self {
+            target,
+            registration,
+            anchor_identity,
+        }
     }
 }
 
@@ -94,10 +201,11 @@ struct RegistrationState {
     /// corresponding record and all secondary indexes.
     target_ids: HashMap<SharedPath, RegistrationId>,
     records: Vec<RegistrationRecord>,
-    /// Anchor counters for native anchors equal to a logical target, indexed by
-    /// the same stable ID as `records`. Keeping this dense preserves the small
-    /// primary HashMap value used by event routing.
-    target_anchor_usage: Vec<AnchorUsage>,
+    /// Whether each logical target is itself a native anchor, and if so its
+    /// counters (`TargetAnchor::Root`), indexed by the same stable ID as
+    /// `records`. Keeping this dense preserves the small primary HashMap value
+    /// used by event routing.
+    target_anchor_usage: Vec<TargetAnchor>,
     /// Native anchors which are not themselves logical targets. On Linux this
     /// normally contains shared parent directories; missing paths also use an
     /// existing ancestor here. Anchors equal to a logical target are stored in
@@ -124,37 +232,44 @@ impl RegistrationState {
     }
 
     fn anchor_mode(&self, anchor: &Path) -> Option<bool> {
-        self.target_ids
-            .get(anchor)
-            .and_then(|id| {
-                let usage = &self.target_anchor_usage[*id];
-                (usage.registrations != 0).then_some(usage)
-            })
-            .or_else(|| self.extra_anchors.get(anchor))
-            .map(AnchorUsage::recursive)
+        self.anchor(anchor).map(|(_, usage)| usage.recursive())
+    }
+
+    /// The native anchor registered at exactly this path, if any.
+    fn anchor(&self, path: &Path) -> Option<(&SharedPath, &AnchorUsage)> {
+        match self.target_ids.get_key_value(path) {
+            Some((path, id)) => self.target_anchor_usage[*id]
+                .usage()
+                .map(|usage| (path, usage)),
+            None => self.extra_anchors.get_key_value(path),
+        }
+    }
+
+    fn anchor_usage_mut(&mut self, anchor: &Path) -> Option<&mut AnchorUsage> {
+        match self.target_ids.get(anchor) {
+            Some(id) => self.target_anchor_usage[*id].usage_mut(),
+            None => self.extra_anchors.get_mut(anchor),
+        }
     }
 
     fn anchors(&self) -> impl Iterator<Item = (&SharedPath, &AnchorUsage)> {
         self.target_ids
             .iter()
             .filter_map(|(path, id)| {
-                let usage = &self.target_anchor_usage[*id];
-                (usage.registrations != 0).then_some((path, usage))
+                self.target_anchor_usage[*id]
+                    .usage()
+                    .map(|usage| (path, usage))
             })
             .chain(self.extra_anchors.iter())
     }
 
     #[cfg(test)]
     fn anchor_count(&self) -> usize {
-        self.target_ids
-            .values()
-            .filter(|id| self.target_anchor_usage[**id].registrations != 0)
-            .count()
-            + self.extra_anchors.len()
+        self.anchors().count()
     }
 
     fn has_anchor(&self, anchor: &Path) -> bool {
-        self.anchor_mode(anchor).is_some()
+        self.anchor(anchor).is_some()
     }
 
     fn interned_path(&self, path: &Path) -> Option<&SharedPath> {
@@ -164,37 +279,49 @@ impl RegistrationState {
             .or_else(|| self.extra_anchors.get_key_value(path).map(|(path, _)| path))
     }
 
-    fn add_anchor_usage(&mut self, anchor: SharedPath, recursive: bool) {
-        let usage = if let Some(id) = self.target_ids.get(anchor.as_ref()) {
-            &mut self.target_anchor_usage[*id]
-        } else {
-            self.extra_anchors.entry(anchor).or_default()
-        };
-        usage.registrations += 1;
-        if recursive {
-            usage.recursive_count += 1;
+    /// Count one more registration on `anchor`. `identity` is recorded only
+    /// when this creates the anchor; an existing native watch keeps the
+    /// identity it was registered with.
+    fn add_anchor_usage(&mut self, anchor: SharedPath, recursive: bool, identity: FileIdentity) {
+        if let Some(usage) = self.anchor_usage_mut(&anchor) {
+            usage.add(recursive);
+            return;
+        }
+        let usage = AnchorUsage::new(recursive, identity);
+        match self.target_ids.get(anchor.as_ref()) {
+            Some(id) => self.target_anchor_usage[*id] = TargetAnchor::Root(usage),
+            None => {
+                self.extra_anchors.insert(anchor, usage);
+            }
         }
     }
 
     fn remove_anchor_usage(&mut self, anchor: &Path, recursive: bool) {
-        if let Some(id) = self.target_ids.get(anchor) {
-            let usage = &mut self.target_anchor_usage[*id];
-            usage.registrations -= 1;
-            if recursive {
-                usage.recursive_count -= 1;
+        match self.target_ids.get(anchor) {
+            Some(id) => {
+                let slot = &mut self.target_anchor_usage[*id];
+                if let TargetAnchor::Root(usage) =
+                    std::mem::replace(slot, TargetAnchor::ViaOtherAnchor)
+                    && let AfterRemove::StillUsed(usage) = usage.remove(recursive)
+                {
+                    *slot = TargetAnchor::Root(usage);
+                }
             }
-            return;
+            None => {
+                if let Some((anchor, usage)) = self.extra_anchors.remove_entry(anchor)
+                    && let AfterRemove::StillUsed(usage) = usage.remove(recursive)
+                {
+                    self.extra_anchors.insert(anchor, usage);
+                }
+            }
         }
+    }
 
-        let remove = self.extra_anchors.get_mut(anchor).is_some_and(|usage| {
-            usage.registrations -= 1;
-            if recursive {
-                usage.recursive_count -= 1;
-            }
-            usage.registrations == 0
-        });
-        if remove {
-            self.extra_anchors.remove(anchor);
+    /// Record that the native watch on `anchor` was re-registered on the
+    /// object now at `identity`.
+    fn restamp_anchor(&mut self, anchor: &Path, identity: FileIdentity) {
+        if let Some(usage) = self.anchor_usage_mut(anchor) {
+            usage.identity = identity;
         }
     }
 
@@ -208,7 +335,7 @@ impl RegistrationState {
         }
     }
 
-    fn add_to_indexes(&mut self, id: RegistrationId) {
+    fn add_to_indexes(&mut self, id: RegistrationId, anchor_identity: FileIdentity) {
         let (anchor, anchor_recursive, directly_indexed) = {
             let record = &self.records[id];
             (
@@ -217,7 +344,7 @@ impl RegistrationState {
                 Self::directly_indexed(record.target.as_ref(), &record.registration),
             )
         };
-        self.add_anchor_usage(anchor, anchor_recursive);
+        self.add_anchor_usage(anchor, anchor_recursive, anchor_identity);
 
         if directly_indexed {
             return;
@@ -266,7 +393,12 @@ impl RegistrationState {
 
     /// Insert or replace one registration. Returns whether the native pathset
     /// changed; index-only changes are immediately visible to event dispatch.
-    fn insert(&mut self, target: SharedPath, mut registration: WatchRegistration) -> bool {
+    fn insert(&mut self, resolved: ResolvedWatch) -> bool {
+        let ResolvedWatch {
+            target,
+            mut registration,
+            anchor_identity,
+        } = resolved;
         let existing_id = self.target_ids.get(target.as_ref()).copied();
         let target = existing_id
             .map(|id| self.records[id].target.clone())
@@ -293,9 +425,14 @@ impl RegistrationState {
             let old = self.records[id].registration.clone();
             let old_anchor_before = self.anchor_mode(old.anchor.as_ref());
             let new_anchor_before = self.anchor_mode(registration.anchor.as_ref());
+            // The native watch survives when the anchor stays the same, even if
+            // removing the old registration briefly leaves it unused.
+            let anchor_identity = self
+                .anchor(registration.anchor.as_ref())
+                .map_or(anchor_identity, |(_, usage)| usage.identity);
             self.remove_from_indexes(id, &old);
             self.records[id].registration = registration.clone();
-            self.add_to_indexes(id);
+            self.add_to_indexes(id, anchor_identity);
 
             old_anchor_before != self.anchor_mode(old.anchor.as_ref())
                 || new_anchor_before != self.anchor_mode(registration.anchor.as_ref())
@@ -305,14 +442,14 @@ impl RegistrationState {
             let anchor_usage = self
                 .extra_anchors
                 .remove(target.as_ref())
-                .unwrap_or_default();
+                .map_or(TargetAnchor::ViaOtherAnchor, TargetAnchor::Root);
             self.target_ids.insert(target.clone(), id);
             self.records.push(RegistrationRecord {
                 target,
                 registration: registration.clone(),
             });
             self.target_anchor_usage.push(anchor_usage);
-            self.add_to_indexes(id);
+            self.add_to_indexes(id, anchor_identity);
             anchor_before != self.anchor_mode(registration.anchor.as_ref())
         }
     }
@@ -361,19 +498,6 @@ impl RegistrationState {
         }
     }
 
-    fn invalidated_anchor(&self, event_path: &Path) -> Option<SharedPath> {
-        self.target_ids
-            .get_key_value(event_path)
-            .and_then(|(path, id)| {
-                (self.target_anchor_usage[*id].registrations != 0).then(|| path.clone())
-            })
-            .or_else(|| {
-                self.extra_anchors
-                    .get_key_value(event_path)
-                    .map(|(path, _)| path.clone())
-            })
-    }
-
     fn paths_for_ids(&self, ids: &HashSet<RegistrationId>) -> Vec<PathBuf> {
         ids.iter()
             .filter_map(|id| self.records.get(*id))
@@ -384,13 +508,13 @@ impl RegistrationState {
     fn targets_needing_refresh(
         &self,
         ids: &HashSet<RegistrationId>,
-        may_change_watch: bool,
+        change: PathChange,
         refresh: &mut HashSet<RegistrationId>,
     ) {
         refresh.extend(ids.iter().copied().filter(|id| {
             self.records.get(*id).is_some_and(|record| {
                 record.registration.pending
-                    || (may_change_watch && record.registration.watch_missing)
+                    || (change.may_add_or_remove() && record.registration.watch_missing)
             })
         }));
     }
@@ -593,21 +717,63 @@ fn set_pathset<'a>(
     }));
 }
 
-fn event_kind_may_invalidate_watch(kind: &FileEventKind) -> bool {
-    matches!(
-        kind,
-        FileEventKind::Remove(_)
-            | FileEventKind::Any
-            | FileEventKind::Other
-            | FileEventKind::Modify(ModifyKind::Name(_))
-    )
+/// What a native event says about its paths, ordered by how much watcher work
+/// it calls for. A path reported several times in one batch takes the maximum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PathChange {
+    /// Content may have changed.
+    Content,
+    /// The native watcher dropped events at or below the path: FSEvents
+    /// `MustScanSubDirs`, delivered for every stream root when the kernel or
+    /// fseventsd falls behind. The watch itself is still live, but any change
+    /// may have happened unseen, including a replacement of the anchor.
+    EventsDropped,
+    /// The path may have been removed, renamed or replaced, and a native watch
+    /// on it may now follow the old file.
+    Replaced,
 }
 
-fn event_may_invalidate_watch(event: &watchexec_events::Event) -> bool {
-    event.tags.iter().any(|tag| match tag {
-        Tag::FileEventKind(kind) => event_kind_may_invalidate_watch(kind),
-        _ => false,
-    })
+impl PathChange {
+    /// Classify a native event, or `None` if it cannot affect content.
+    fn of(event: &watchexec_events::Event) -> Option<Self> {
+        event
+            .tags
+            .iter()
+            .filter_map(|tag| match tag {
+                Tag::FileEventKind(kind) => Self::of_kind(kind, event),
+                _ => None,
+            })
+            .max()
+    }
+
+    fn of_kind(kind: &FileEventKind, event: &watchexec_events::Event) -> Option<Self> {
+        match kind {
+            FileEventKind::Create(_)
+            | FileEventKind::Modify(ModifyKind::Any | ModifyKind::Data(_)) => Some(Self::Content),
+            FileEventKind::Remove(_)
+            | FileEventKind::Any
+            | FileEventKind::Modify(ModifyKind::Name(_)) => Some(Self::Replaced),
+            FileEventKind::Other if is_rescan_notice(event) => Some(Self::EventsDropped),
+            FileEventKind::Other => Some(Self::Replaced),
+            FileEventKind::Access(_) | FileEventKind::Modify(_) => None,
+        }
+    }
+
+    /// Whether paths at or below the event path may have appeared or
+    /// disappeared, so missing-tolerant targets must be re-resolved.
+    fn may_add_or_remove(self) -> bool {
+        self >= Self::EventsDropped
+    }
+}
+
+/// notify reports a rescan request (FSEvents `MustScanSubDirs`, inotify queue
+/// overflow) as `Other`, and watchexec keeps only its info string, which is
+/// absent or `rescan: user dropped` / `rescan: kernel dropped`.
+fn is_rescan_notice(event: &watchexec_events::Event) -> bool {
+    event
+        .metadata
+        .get("file-event-info")
+        .is_none_or(|info| info.iter().all(|info| info.starts_with("rescan")))
 }
 
 impl WatcherHandle {
@@ -677,8 +843,7 @@ impl WatcherHandle {
         let mut paths = paths.into_iter();
         let mut targets = Vec::with_capacity(RESOLUTION_BATCH_SIZE);
         let mut new_targets = Vec::with_capacity(RESOLUTION_BATCH_SIZE);
-        let mut registrations: Vec<(SharedPath, WatchRegistration)> =
-            Vec::with_capacity(RESOLUTION_BATCH_SIZE);
+        let mut registrations = Vec::with_capacity(RESOLUTION_BATCH_SIZE);
         let mut changed = false;
 
         loop {
@@ -705,14 +870,12 @@ impl WatcherHandle {
             // existing_target_anchor may perform metadata syscalls on Linux;
             // resolve those without holding the registration-state lock.
             registrations.clear();
-            registrations.extend(
-                new_targets
-                    .drain(..)
-                    .map(|target| direct_registration_from_target(target, self.recursive)),
-            );
+            registrations.extend(new_targets.drain(..).map(|target| {
+                ResolvedWatch::new(direct_registration_from_target(target, self.recursive))
+            }));
             let mut state = self.registrations.lock().unwrap();
-            for (target, registration) in registrations.drain(..) {
-                changed |= state.insert(target, registration);
+            for resolved in registrations.drain(..) {
+                changed |= state.insert(resolved);
             }
         }
 
@@ -732,7 +895,10 @@ impl WatcherHandle {
     {
         // Registration resolution performs metadata/canonicalization syscalls;
         // finish the lazy iterator before taking either watcher lock.
-        let new_registrations: Vec<_> = new_registrations.into_iter().collect();
+        let new_registrations: Vec<_> = new_registrations
+            .into_iter()
+            .map(ResolvedWatch::new)
+            .collect();
         let _op = self.operation_lock.lock().await;
         // Subscribe BEFORE updating pathset so we don't miss the ready signal.
         let mut ready = self.config.as_ref().map(|c| c.fs_ready());
@@ -740,16 +906,16 @@ impl WatcherHandle {
         let changed = {
             let mut state = self.registrations.lock().unwrap();
             let mut changed = false;
-            for (target, mut registration) in new_registrations {
-                if let Some(existing) = state.registration(target.as_ref())
+            for mut resolved in new_registrations {
+                if let Some(existing) = state.registration(resolved.target.as_ref())
                     && existing.watch_missing
-                    && !registration.watch_missing
+                    && !resolved.registration.watch_missing
                 {
                     // A generic cached-input watch must not downgrade a
                     // logical watch for the same path.
-                    registration = existing.clone();
+                    resolved.registration = existing.clone();
                 }
-                changed |= state.insert(target, registration);
+                changed |= state.insert(resolved);
             }
 
             if changed && let Some(ref config) = self.config {
@@ -813,20 +979,21 @@ impl WatcherHandle {
         let refreshed: Vec<_> = logical_targets
             .into_iter()
             .filter_map(|(target, recursive)| logical_registration(target.as_ref(), recursive))
+            .map(ResolvedWatch::new)
             .collect();
         let mut ready = self.config.as_ref().map(|config| config.fs_ready());
 
         let changed = {
             let mut state = self.registrations.lock().unwrap();
             let mut changed = false;
-            for (target, registration) in refreshed {
+            for resolved in refreshed {
                 // A target could only change kind while this operation held the
                 // operation lock; retain the guard for defensive correctness.
                 if state
-                    .registration(target.as_ref())
+                    .registration(resolved.target.as_ref())
                     .is_some_and(|current| current.watch_missing)
                 {
-                    changed |= state.insert(target, registration);
+                    changed |= state.insert(resolved);
                 }
             }
             if changed && let Some(ref config) = self.config {
@@ -875,9 +1042,17 @@ impl WatcherHandle {
         }
         wait_fs_ready(&mut ready, &self.fs_worker).await;
 
+        // The re-registered watches follow whatever is at the anchors now.
+        let identities: Vec<_> = active_anchors
+            .iter()
+            .map(|anchor| (anchor, FileIdentity::of(anchor)))
+            .collect();
         let mut ready = config.fs_ready();
         {
-            let state = self.registrations.lock().unwrap();
+            let mut state = self.registrations.lock().unwrap();
+            for (anchor, identity) in identities {
+                state.restamp_anchor(anchor, identity);
+            }
             set_pathset(config, state.anchors());
         }
         wait_fs_ready(&mut ready, &self.fs_worker).await;
@@ -888,6 +1063,9 @@ impl WatcherHandle {
     /// This is an explicit recovery operation. Normal file replacement uses
     /// stable parent watches on Linux and targeted re-registration on macOS,
     /// since a full FSEvents restart is disruptive.
+    ///
+    /// Recorded anchor identities are kept: a stale one costs at most one
+    /// targeted re-registration on a later dropped-events notice.
     pub async fn rewatch_all(&self) {
         let _op = self.operation_lock.lock().await;
         let logical_targets: Vec<_> = {
@@ -906,6 +1084,7 @@ impl WatcherHandle {
         let refreshed: Vec<_> = logical_targets
             .into_iter()
             .filter_map(|(target, recursive)| logical_registration(target.as_ref(), recursive))
+            .map(ResolvedWatch::new)
             .collect();
         let mut ready = self.config.as_ref().map(|c| c.fs_ready());
 
@@ -926,8 +1105,8 @@ impl WatcherHandle {
 
         {
             let mut state = self.registrations.lock().unwrap();
-            for (target, registration) in refreshed {
-                state.insert(target, registration);
+            for resolved in refreshed {
+                state.insert(resolved);
             }
             if let Some(ref config) = self.config {
                 set_pathset(config, state.anchors());
@@ -946,17 +1125,13 @@ impl WatcherHandle {
     async fn apply_events(&self, events: &[watchexec_events::Event]) -> Option<FileChangeBatch> {
         let mut raw_event_paths = HashMap::new();
         for event in events {
-            if !is_restart_worthy_event(event) {
+            let Some(change) = PathChange::of(event) else {
                 continue;
-            }
-            let may_invalidate_watch = event_may_invalidate_watch(event);
+            };
             let mut saw_path = false;
             for (path, _) in event.paths() {
                 saw_path = true;
-                raw_event_paths
-                    .entry(path.to_path_buf())
-                    .and_modify(|invalidate| *invalidate |= may_invalidate_watch)
-                    .or_insert(may_invalidate_watch);
+                merge_change(&mut raw_event_paths, path.to_path_buf(), change);
             }
             if !saw_path {
                 // inotify queue overflows are pathless. Preserve that
@@ -974,27 +1149,31 @@ impl WatcherHandle {
         // Deduplicate before the comparatively expensive canonicalization
         // syscall.
         let mut event_paths = HashMap::with_capacity(raw_event_paths.len());
-        for (path, may_invalidate_watch) in raw_event_paths {
+        for (path, change) in raw_event_paths {
             let canonical = path.canonicalize().unwrap_or(path);
-            event_paths
-                .entry(canonical)
-                .and_modify(|invalidate| *invalidate |= may_invalidate_watch)
-                .or_insert(may_invalidate_watch);
+            merge_change(&mut event_paths, canonical, change);
         }
 
         let mut affected = HashSet::new();
         let mut refresh = HashSet::new();
-        let mut invalidated = HashSet::new();
+        let mut rewatch = HashSet::new();
+        let mut verify = Vec::new();
         let (paths, refresh_targets) = {
             let state = self.registrations.lock().unwrap();
             let mut event_affected = HashSet::new();
-            for (path, may_invalidate_watch) in &event_paths {
+            for (path, change) in &event_paths {
                 event_affected.clear();
                 state.affected_targets(path, &mut event_affected);
-                state.targets_needing_refresh(&event_affected, *may_invalidate_watch, &mut refresh);
+                state.targets_needing_refresh(&event_affected, *change, &mut refresh);
                 affected.extend(event_affected.iter().copied());
-                if *may_invalidate_watch && let Some(anchor) = state.invalidated_anchor(path) {
-                    invalidated.insert(anchor);
+                match (change, state.anchor(path)) {
+                    (PathChange::Replaced, Some((anchor, _))) => {
+                        rewatch.insert(anchor.clone());
+                    }
+                    (PathChange::EventsDropped, Some((anchor, usage))) => {
+                        verify.push((anchor.clone(), usage.identity));
+                    }
+                    _ => {}
                 }
             }
             (
@@ -1003,9 +1182,20 @@ impl WatcherHandle {
             )
         };
 
+        // A dropped-events notice arrives for every stream root at once and
+        // repeats while fseventsd is overloaded. Re-registering a root
+        // restarts the whole FSEvents stream, so only do it for anchors that
+        // were actually replaced or removed while events were lost.
+        rewatch.extend(
+            verify
+                .into_iter()
+                .filter(|(anchor, identity)| FileIdentity::of(anchor) != *identity)
+                .map(|(anchor, _)| anchor),
+        );
+
         self.refresh_logical_targets(refresh_targets).await;
-        if !invalidated.is_empty() {
-            self.rewatch_anchors(&invalidated).await;
+        if !rewatch.is_empty() {
+            self.rewatch_anchors(&rewatch).await;
         }
 
         (!paths.is_empty()).then_some(FileChangeBatch {
@@ -1075,20 +1265,20 @@ impl FileWatcher {
         // Canonicalize watch paths to resolve symlinks.
         // On macOS, /tmp -> /private/tmp and /var -> /private/var;
         // FSEvents reports events using resolved paths.
-        let initial_registrations: Vec<(SharedPath, WatchRegistration)> = config
+        let initial_registrations: Vec<_> = config
             .paths
             .iter()
-            .map(|path| direct_registration(path, config.recursive))
+            .map(|path| ResolvedWatch::new(direct_registration(path, config.recursive)))
             .collect();
         let paths: Vec<PathBuf> = initial_registrations
             .iter()
-            .map(|(_, registration)| registration.anchor.to_path_buf())
+            .map(|resolved| resolved.registration.anchor.to_path_buf())
             .collect();
 
         {
             let mut state = registrations.lock().unwrap();
-            for (target, registration) in initial_registrations {
-                state.insert(target, registration);
+            for resolved in initial_registrations {
+                state.insert(resolved);
             }
         }
 
@@ -1326,22 +1516,9 @@ impl FileWatcher {
     }
 }
 
-fn is_restart_worthy_event(event: &watchexec_events::Event) -> bool {
-    event.tags.iter().any(|tag| match tag {
-        Tag::FileEventKind(kind) => is_restart_worthy_kind(kind),
-        _ => false,
-    })
-}
-
-fn is_restart_worthy_kind(kind: &FileEventKind) -> bool {
-    match kind {
-        FileEventKind::Create(_)
-        | FileEventKind::Remove(_)
-        | FileEventKind::Any
-        | FileEventKind::Other => true,
-        FileEventKind::Modify(ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Name(_)) => true,
-        FileEventKind::Access(_) | FileEventKind::Modify(_) => false,
-    }
+fn merge_change(paths: &mut HashMap<PathBuf, PathChange>, path: PathBuf, change: PathChange) {
+    let merged = paths.entry(path).or_insert(change);
+    *merged = (*merged).max(change);
 }
 
 #[cfg(test)]
@@ -1411,36 +1588,267 @@ mod tests {
         }
     }
 
+    /// A handle backed by a live native watcher whose events nobody consumes,
+    /// so `apply_events` sees only the synthetic events a test feeds it.
+    struct DetachedWatcher {
+        handle: WatcherHandle,
+        worker: JoinHandle<()>,
+        _events:
+            async_priority_channel::Receiver<watchexec_events::Event, watchexec_events::Priority>,
+        _errors: mpsc::Receiver<watchexec::error::RuntimeError>,
+    }
+
+    impl Drop for DetachedWatcher {
+        fn drop(&mut self) {
+            self.worker.abort();
+        }
+    }
+
+    impl DetachedWatcher {
+        fn new() -> Self {
+            let config = Arc::new(Config::default());
+            let (events_tx, events) = async_priority_channel::bounded(4096);
+            let (errors_tx, errors) = mpsc::channel(64);
+            let worker_config = config.clone();
+            // As in `FileWatcher::new`: the sender lives in the worker task, so
+            // `fs_worker` closes when the worker exits and readiness waits return.
+            let (fs_worker_alive, fs_worker) = watch::channel(());
+            let worker = tokio::spawn(async move {
+                let _alive = fs_worker_alive;
+                let _ = watchexec::sources::fs::worker(worker_config, errors_tx, events_tx).await;
+            });
+            Self {
+                handle: WatcherHandle {
+                    registrations: Arc::default(),
+                    operation_lock: Arc::default(),
+                    config: Some(config),
+                    recursive: false,
+                    fs_worker,
+                },
+                worker,
+                _events: events,
+                _errors: errors,
+            }
+        }
+
+        /// Feed one synthetic event through the batch handler and report
+        /// whether it pushed a new native pathset, i.e. re-registered watches.
+        async fn apply(&self, event: watchexec_events::Event) -> bool {
+            let ready = self.handle.config.as_ref().expect("config").fs_ready();
+            self.handle.apply_events(&[event]).await;
+            ready.has_changed().expect("fs worker alive")
+        }
+
+        fn registration(&self, target: &Path) -> WatchRegistration {
+            self.handle
+                .registrations
+                .lock()
+                .unwrap()
+                .registration(target)
+                .expect("registration")
+                .clone()
+        }
+    }
+
+    fn native_event(
+        kind: FileEventKind,
+        path: &Path,
+        info: Option<&str>,
+    ) -> watchexec_events::Event {
+        let mut event = watchexec_events::Event::default();
+        event.tags.push(Tag::FileEventKind(kind));
+        event.tags.push(Tag::Path {
+            path: path.to_path_buf(),
+            file_type: None,
+        });
+        if let Some(info) = info {
+            event
+                .metadata
+                .insert("file-event-info".to_string(), vec![info.to_string()]);
+        }
+        event
+    }
+
+    /// What notify emits on every FSEvents stream root when fseventsd drops
+    /// events (`MustScanSubDirs | UserDropped`).
+    fn dropped_events_notice(root: &Path) -> watchexec_events::Event {
+        native_event(FileEventKind::Other, root, Some("rescan: user dropped"))
+    }
+
+    #[tokio::test]
+    async fn test_dropped_events_notice_keeps_unchanged_anchor() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let watched = temp_dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize")
+            .join("watched");
+        fs::create_dir(&watched).expect("create watched directory");
+        let watcher = DetachedWatcher::new();
+        watcher.handle.watch(&watched).await;
+
+        // Restarting the FSEvents stream for a root that is still the same
+        // directory registers new fseventsd clients for nothing, and the
+        // notice repeats while fseventsd is overloaded.
+        let ready = watcher.handle.config.as_ref().unwrap().fs_ready();
+        let batch = watcher
+            .handle
+            .apply_events(&[dropped_events_notice(&watched)])
+            .await
+            .expect("affected dependency is still reported");
+        assert_eq!(batch.paths, vec![watched.clone()]);
+        assert!(
+            !ready.has_changed().unwrap(),
+            "a dropped-events notice for an unchanged anchor must not re-register it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dropped_events_notice_reregisters_replaced_anchor() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let base = temp_dir.path().canonicalize().expect("canonicalize");
+        let watched = base.join("watched");
+        let replacement = base.join("replacement");
+        fs::create_dir(&watched).expect("create watched directory");
+        let watcher = DetachedWatcher::new();
+        watcher.handle.watch(&watched).await;
+
+        // The rename that replaced the root was among the dropped events.
+        fs::create_dir(&replacement).expect("create replacement directory");
+        fs::rename(&replacement, &watched).expect("replace watched directory");
+
+        assert!(
+            watcher.apply(dropped_events_notice(&watched)).await,
+            "an anchor replaced while events were dropped must be re-registered"
+        );
+        assert!(
+            !watcher.apply(dropped_events_notice(&watched)).await,
+            "the re-registered anchor is current, so a later notice is a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dropped_events_notice_reanchors_created_missing_target() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let base = temp_dir.path().canonicalize().expect("canonicalize");
+        let target = base.join(".env");
+        let watcher = DetachedWatcher::new();
+        watcher.handle.watch_logical(&target).await;
+        assert!(watcher.registration(&target).pending);
+
+        // The create event was among the dropped events.
+        fs::write(&target, "VALUE=created\n").expect("create dotenv");
+        watcher.apply(dropped_events_notice(&base)).await;
+
+        assert!(!watcher.registration(&target).pending);
+    }
+
+    #[tokio::test]
+    async fn test_dropped_events_notice_reanchors_removed_logical_target() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let base = temp_dir.path().canonicalize().expect("canonicalize");
+        let target = base.join(".env");
+        fs::write(&target, "VALUE=old\n").expect("create dotenv");
+        let watcher = DetachedWatcher::new();
+        watcher.handle.watch_logical(&target).await;
+        let anchor = watcher.registration(&target).anchor;
+        assert!(!watcher.registration(&target).pending);
+
+        // The remove event was among the dropped events. The notice names
+        // the stream root, which is the target itself on macOS.
+        fs::remove_file(&target).expect("remove dotenv");
+        watcher.apply(dropped_events_notice(&anchor)).await;
+
+        let registration = watcher.registration(&target);
+        assert!(
+            registration.pending,
+            "a logical target removed while events were dropped must fall back to its ancestor"
+        );
+        assert_eq!(registration.anchor.as_ref(), base.as_path());
+    }
+
+    #[tokio::test]
+    async fn test_replacement_events_reregister_anchor() {
+        use watchexec_events::filekind::{RemoveKind, RenameMode};
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let watched = temp_dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize")
+            .join("watched");
+        fs::create_dir(&watched).expect("create watched directory");
+        let watcher = DetachedWatcher::new();
+        watcher.handle.watch(&watched).await;
+
+        // Remove and rename events re-register without checking identity:
+        // the native watch may already follow the old inode.
+        for kind in [
+            FileEventKind::Remove(RemoveKind::Folder),
+            FileEventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            FileEventKind::Any,
+        ] {
+            assert!(
+                watcher.apply(native_event(kind, &watched, None)).await,
+                "{kind:?} must re-register the anchor"
+            );
+        }
+    }
+
     #[test]
-    fn test_restart_worthy_kind_filter() {
+    fn test_event_classification() {
         use watchexec_events::filekind::{
             AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, RemoveKind, RenameMode,
         };
 
-        assert!(is_restart_worthy_kind(&FileEventKind::Create(
-            CreateKind::File
-        )));
-        assert!(is_restart_worthy_kind(&FileEventKind::Remove(
-            RemoveKind::File
-        )));
-        assert!(is_restart_worthy_kind(&FileEventKind::Modify(
-            ModifyKind::Data(DataChange::Any,)
-        )));
-        assert!(is_restart_worthy_kind(&FileEventKind::Modify(
-            ModifyKind::Name(RenameMode::Any,)
-        )));
-        assert!(is_restart_worthy_kind(&FileEventKind::Modify(
-            ModifyKind::Any
-        )));
-        assert!(is_restart_worthy_kind(&FileEventKind::Any));
-        assert!(is_restart_worthy_kind(&FileEventKind::Other));
+        let path = Path::new("/project/devenv.nix");
+        let classify = |kind, info| PathChange::of(&native_event(kind, path, info));
 
-        assert!(!is_restart_worthy_kind(&FileEventKind::Access(
-            AccessKind::Open(AccessMode::Read,)
-        )));
-        assert!(!is_restart_worthy_kind(&FileEventKind::Modify(
-            ModifyKind::Metadata(MetadataKind::Any),
-        )));
+        for kind in [
+            FileEventKind::Create(CreateKind::File),
+            FileEventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            FileEventKind::Modify(ModifyKind::Any),
+        ] {
+            assert_eq!(classify(kind, None), Some(PathChange::Content), "{kind:?}");
+        }
+        for kind in [
+            FileEventKind::Remove(RemoveKind::File),
+            FileEventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            FileEventKind::Any,
+        ] {
+            assert_eq!(classify(kind, None), Some(PathChange::Replaced), "{kind:?}");
+        }
+        for info in [
+            Some("rescan: user dropped"),
+            Some("rescan: kernel dropped"),
+            None,
+        ] {
+            assert_eq!(
+                classify(FileEventKind::Other, info),
+                Some(PathChange::EventsDropped),
+                "{info:?}"
+            );
+        }
+        // An `Other` that is not a known rescan notice stays conservative.
+        assert_eq!(
+            classify(FileEventKind::Other, Some("something else")),
+            Some(PathChange::Replaced)
+        );
+
+        assert_eq!(
+            classify(
+                FileEventKind::Access(AccessKind::Open(AccessMode::Read)),
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            classify(
+                FileEventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+                None
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1459,7 +1867,7 @@ mod tests {
         assert!(registration.pending);
 
         let mut state = RegistrationState::default();
-        state.insert(logical_target, registration);
+        state.insert(ResolvedWatch::new((logical_target, registration)));
         assert_eq!(state.anchor_mode(base.as_path()), Some(false));
     }
 
@@ -1471,7 +1879,7 @@ mod tests {
         let (logical_target, registration) =
             logical_registration(&target, false).expect("resolve logical registration");
         let mut state = RegistrationState::default();
-        state.insert(logical_target, registration);
+        state.insert(ResolvedWatch::new((logical_target, registration)));
 
         let mut affected = HashSet::new();
         state.affected_targets(&base.join("target/debug/deps/example.rlib"), &mut affected);
@@ -1489,9 +1897,9 @@ mod tests {
         let second = PathBuf::from("/tmp/second");
         let mut state = RegistrationState::default();
         let (target, registration) = direct_registration(&first, false);
-        state.insert(target, registration);
+        state.insert(ResolvedWatch::new((target, registration)));
         let (target, registration) = direct_registration(&second, false);
-        state.insert(target, registration);
+        state.insert(ResolvedWatch::new((target, registration)));
 
         assert_eq!(
             state.watched_paths().into_iter().collect::<HashSet<_>>(),
@@ -1509,7 +1917,7 @@ mod tests {
                 anchor.clone(),
                 false,
             );
-            state.insert(target, registration);
+            state.insert(ResolvedWatch::new((target, registration)));
         }
 
         assert_eq!(state.records.len(), 10_000);
@@ -1541,9 +1949,9 @@ mod tests {
             indexed_file_registration(PathBuf::from("/project/src/b.nix"), anchor.clone(), true);
         let mut state = RegistrationState::default();
 
-        assert!(state.insert(first, registration));
+        assert!(state.insert(ResolvedWatch::new((first, registration))));
         assert_eq!(state.anchor_mode(anchor.as_ref()), Some(false));
-        assert!(state.insert(second, recursive_registration));
+        assert!(state.insert(ResolvedWatch::new((second, recursive_registration))));
         assert_eq!(state.anchor_mode(anchor.as_ref()), Some(true));
     }
 
@@ -1561,7 +1969,7 @@ mod tests {
         };
         let mut state = RegistrationState::default();
 
-        assert!(state.insert(target.clone(), registration));
+        assert!(state.insert(ResolvedWatch::new((target.clone(), registration))));
         assert_eq!(state.anchor_count(), 1);
         assert!(state.extra_anchors.is_empty());
         assert_eq!(state.anchor_mode(target.as_ref()), Some(false));
@@ -1573,7 +1981,7 @@ mod tests {
         let (dependent, registration) =
             indexed_file_registration(PathBuf::from("/project/devenv.nix"), anchor.clone(), false);
         let mut state = RegistrationState::default();
-        assert!(state.insert(dependent, registration));
+        assert!(state.insert(ResolvedWatch::new((dependent, registration))));
         assert_eq!(state.extra_anchors.len(), 1);
 
         let registration = WatchRegistration {
@@ -1585,12 +1993,17 @@ mod tests {
             anchor_recursive: false,
             recursive: false,
         };
-        assert!(!state.insert(anchor.clone(), registration));
+        assert!(!state.insert(ResolvedWatch::new((anchor.clone(), registration))));
 
         assert!(state.extra_anchors.is_empty());
         assert_eq!(state.anchor_count(), 1);
         assert_eq!(
-            state.target_anchor_usage[state.target_ids[anchor.as_ref()]].registrations,
+            state
+                .anchor(anchor.as_ref())
+                .expect("anchor")
+                .1
+                .registrations
+                .get(),
             2
         );
     }
@@ -1601,9 +2014,9 @@ mod tests {
         let file = directory.join("devenv.nix");
         let mut state = RegistrationState::default();
         let (target, registration) = direct_registration(&directory, true);
-        state.insert(target, registration);
+        state.insert(ResolvedWatch::new((target, registration)));
 
-        assert!(state.invalidated_anchor(&file).is_none());
+        assert!(state.anchor(&file).is_none());
     }
 
     #[test]
@@ -1614,13 +2027,13 @@ mod tests {
         let file = file.canonicalize().expect("canonicalize watched file");
         let mut state = RegistrationState::default();
         let (target, registration) = direct_registration(&file, false);
-        state.insert(target, registration);
+        state.insert(ResolvedWatch::new((target, registration)));
 
         if cfg!(target_os = "linux") {
-            assert!(state.invalidated_anchor(&file).is_none());
+            assert!(state.anchor(&file).is_none());
         } else {
             assert_eq!(
-                state.invalidated_anchor(&file).as_deref(),
+                state.anchor(&file).map(|(anchor, _)| anchor.as_ref()),
                 Some(file.as_path())
             );
         }
