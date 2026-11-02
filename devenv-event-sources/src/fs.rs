@@ -939,6 +939,81 @@ impl WatcherHandle {
         }
     }
 
+    /// Apply one throttled batch of native events to the watch registrations.
+    ///
+    /// Re-anchors and re-registers whatever the events may have invalidated,
+    /// and returns the logical dependencies they affect, if any.
+    async fn apply_events(&self, events: &[watchexec_events::Event]) -> Option<FileChangeBatch> {
+        let mut raw_event_paths = HashMap::new();
+        for event in events {
+            if !is_restart_worthy_event(event) {
+                continue;
+            }
+            let may_invalidate_watch = event_may_invalidate_watch(event);
+            let mut saw_path = false;
+            for (path, _) in event.paths() {
+                saw_path = true;
+                raw_event_paths
+                    .entry(path.to_path_buf())
+                    .and_modify(|invalidate| *invalidate |= may_invalidate_watch)
+                    .or_insert(may_invalidate_watch);
+            }
+            if !saw_path {
+                // inotify queue overflows are pathless. Preserve that
+                // information as one rescan instead of enqueueing every
+                // watched path separately.
+                self.rewatch_all().await;
+                return Some(FileChangeBatch {
+                    paths: Vec::new(),
+                    rescan: true,
+                });
+            }
+        }
+
+        // Native backends often emit several event kinds for the same path.
+        // Deduplicate before the comparatively expensive canonicalization
+        // syscall.
+        let mut event_paths = HashMap::with_capacity(raw_event_paths.len());
+        for (path, may_invalidate_watch) in raw_event_paths {
+            let canonical = path.canonicalize().unwrap_or(path);
+            event_paths
+                .entry(canonical)
+                .and_modify(|invalidate| *invalidate |= may_invalidate_watch)
+                .or_insert(may_invalidate_watch);
+        }
+
+        let mut affected = HashSet::new();
+        let mut refresh = HashSet::new();
+        let mut invalidated = HashSet::new();
+        let (paths, refresh_targets) = {
+            let state = self.registrations.lock().unwrap();
+            let mut event_affected = HashSet::new();
+            for (path, may_invalidate_watch) in &event_paths {
+                event_affected.clear();
+                state.affected_targets(path, &mut event_affected);
+                state.targets_needing_refresh(&event_affected, *may_invalidate_watch, &mut refresh);
+                affected.extend(event_affected.iter().copied());
+                if *may_invalidate_watch && let Some(anchor) = state.invalidated_anchor(path) {
+                    invalidated.insert(anchor);
+                }
+            }
+            (
+                state.paths_for_ids(&affected),
+                state.logical_targets_for_ids(&refresh),
+            )
+        };
+
+        self.refresh_logical_targets(refresh_targets).await;
+        if !invalidated.is_empty() {
+            self.rewatch_anchors(&invalidated).await;
+        }
+
+        (!paths.is_empty()).then_some(FileChangeBatch {
+            paths,
+            rescan: false,
+        })
+    }
+
     /// Returns logical content dependencies, never their fallback OS anchors.
     pub fn watched_paths(&self) -> Vec<PathBuf> {
         self.registrations.lock().unwrap().watched_paths()
@@ -1137,27 +1212,14 @@ impl FileWatcher {
         // so we reimplement it here.
         let throttle = config.throttle;
         let watch_tx = tx.clone();
-        let event_registrations = registrations;
         let event_handle = handle.clone();
         let filter_task = tokio::spawn(async move {
             use watchexec::filter::Filterer;
 
             let mut batch = Vec::new();
-            let mut raw_event_paths = HashMap::new();
-            let mut event_paths = HashMap::new();
-            let mut affected = HashSet::new();
-            let mut refresh = HashSet::new();
-            let mut invalidated = HashSet::new();
-            let mut event_affected = HashSet::new();
+            let mut events = Vec::new();
 
             loop {
-                batch.clear();
-                raw_event_paths.clear();
-                event_paths.clear();
-                affected.clear();
-                refresh.clear();
-                invalidated.clear();
-                event_affected.clear();
                 let Ok((event, priority)) = ev_r.recv().await else {
                     break;
                 };
@@ -1176,82 +1238,17 @@ impl FileWatcher {
                     }
                 }
 
-                let mut rescan = false;
-                for (event, priority) in &batch {
-                    if !filterer.check_event(event, *priority).unwrap_or(true) {
-                        continue;
-                    }
-                    if !is_restart_worthy_event(event) {
-                        continue;
-                    }
-                    let may_invalidate_watch = event_may_invalidate_watch(event);
-                    let mut saw_path = false;
-                    for (path, _) in event.paths() {
-                        saw_path = true;
-                        raw_event_paths
-                            .entry(path.to_path_buf())
-                            .and_modify(|invalidate| *invalidate |= may_invalidate_watch)
-                            .or_insert(may_invalidate_watch);
-                    }
-                    if !saw_path {
-                        // inotify queue overflows are pathless. Preserve that
-                        // information as one rescan instead of enqueueing every
-                        // watched path separately.
-                        rescan = true;
-                    }
-                }
-
-                // Native backends often emit several event kinds for the same
-                // path. Deduplicate before the comparatively expensive
-                // canonicalization syscall.
-                event_paths.reserve(raw_event_paths.len());
-                for (path, may_invalidate_watch) in raw_event_paths.drain() {
-                    let canonical = path.canonicalize().unwrap_or(path);
-                    event_paths
-                        .entry(canonical)
-                        .and_modify(|invalidate| *invalidate |= may_invalidate_watch)
-                        .or_insert(may_invalidate_watch);
-                }
-
-                let (paths, refresh_targets) = {
-                    let state = event_registrations.lock().unwrap();
-                    if !rescan {
-                        for (path, may_invalidate_watch) in &event_paths {
-                            event_affected.clear();
-                            state.affected_targets(path, &mut event_affected);
-                            state.targets_needing_refresh(
-                                &event_affected,
-                                *may_invalidate_watch,
-                                &mut refresh,
-                            );
-                            affected.extend(event_affected.iter().copied());
-                            if *may_invalidate_watch
-                                && let Some(anchor) = state.invalidated_anchor(path)
-                            {
-                                invalidated.insert(anchor);
-                            }
-                        }
-                    }
-                    (
-                        state.paths_for_ids(&affected),
-                        state.logical_targets_for_ids(&refresh),
-                    )
-                };
-
-                if rescan {
-                    event_handle.rewatch_all().await;
-                } else {
-                    event_handle.refresh_logical_targets(refresh_targets).await;
-                    if !invalidated.is_empty() {
-                        event_handle.rewatch_anchors(&invalidated).await;
-                    }
-                }
-
-                if (rescan || !paths.is_empty())
-                    && watch_tx
-                        .send(FileChangeBatch { paths, rescan })
-                        .await
-                        .is_err()
+                events.clear();
+                events.extend(
+                    batch
+                        .drain(..)
+                        .filter(|(event, priority)| {
+                            filterer.check_event(event, *priority).unwrap_or(true)
+                        })
+                        .map(|(event, _)| event),
+                );
+                if let Some(changes) = event_handle.apply_events(&events).await
+                    && watch_tx.send(changes).await.is_err()
                 {
                     return;
                 }
